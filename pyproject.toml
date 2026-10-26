@@ -1,0 +1,6 @@
+# Tool settings only: this repository is a sample, not an installable package.
+[tool.black]
+line-length = 120
+
+[tool.bandit]
+exclude_dirs = ["tests"]

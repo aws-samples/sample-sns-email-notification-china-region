@@ -1,0 +1,13 @@
+flowchart LR
+  subgraph member["member accounts (unchanged publishers)"]
+    app[application] -->|Publish| topic[SNS topic]
+  end
+  subgraph central["central mail account"]
+    q["SQS queue shards<br/>exact aws:SourceArn allow-list"] -->|batch| fn["Lambda mailer (VPC)"]
+    q -.->|maxReceiveCount| dlq[DLQ]
+    fn -->|route, dedupe| ddb[("DynamoDB<br/>mail-config / mail-delivery")]
+    fn -->|SMTP secret| sm[Secrets Manager]
+    git["Git config (YAML)"] -->|"mailcfg.py: validate, dry-run, versioned write"| ddb
+  end
+  topic -->|"SQS subscription (queue owner), raw delivery off"| q
+  fn -->|"STARTTLS + AUTH :587"| smtp[enterprise SMTP] --> inbox[mailboxes]

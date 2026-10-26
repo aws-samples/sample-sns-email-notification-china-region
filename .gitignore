@@ -1,0 +1,31 @@
+# Credentials & secrets
+.env
+.env.*
+*.pem
+*.key
+credentials
+
+# AI agent configs (must not be committed)
+CLAUDE.md
+AGENTS.md
+.claude/
+
+# Local test evidence and state (addresses, account ids, host names)
+evidence/
+state/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.build/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# A maintainer's local list for tests/test_public_hygiene.py
+.private-names

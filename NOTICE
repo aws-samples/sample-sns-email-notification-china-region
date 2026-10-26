@@ -1,0 +1,12 @@
+Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+Licensed under the MIT-0 License (the "License"). A copy of the License is
+located in the LICENSE file at the root of this repository.
+
+**********************
+THIRD PARTY COMPONENTS
+**********************
+
+This software does not include third party code. It depends on the third party
+packages listed in THIRD_PARTY_LICENSES, which are installed separately and are
+subject to their own licenses.

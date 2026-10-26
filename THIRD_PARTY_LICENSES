@@ -1,0 +1,26 @@
+Third party components used by this sample
+==========================================
+
+None of these components is included in this repository. They are installed
+separately and are subject to their own licenses. None of them is GPL licensed.
+
+Python packages (requirements.txt, for the tools and scripts; the Lambda function
+uses the boto3 of the AWS Lambda Python 3.12 runtime and bundles nothing)
+
+- boto3 - Apache-2.0 - https://github.com/boto/boto3
+- botocore - Apache-2.0 - https://github.com/boto/botocore
+- s3transfer - Apache-2.0 - https://github.com/boto/s3transfer
+- jmespath - MIT - https://github.com/jmespath/jmespath.py
+- python-dateutil - Apache-2.0 OR BSD-3-Clause - https://github.com/dateutil/dateutil
+- six - MIT - https://github.com/benjaminp/six
+- urllib3 - MIT - https://github.com/urllib3/urllib3
+- PyYAML - MIT - https://github.com/yaml/pyyaml
+
+Packages the optional test SMTP host (templates/test-smtp.yaml) installs from the
+Amazon Linux 2023 repositories at deploy time
+
+- Postfix - IPL-1.0 OR EPL-2.0 - https://www.postfix.org/
+- Cyrus SASL - BSD-style (CMU) - https://github.com/cyrusimap/cyrus-sasl
+- OpenSSL - Apache-2.0 - https://www.openssl.org/
+- Python 3 - PSF-2.0 - https://www.python.org/
+- boto3 (python3-boto3, only with DeliveryMode=ses) - Apache-2.0 - https://github.com/boto/boto3

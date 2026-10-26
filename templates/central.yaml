@@ -1,0 +1,639 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  sample-sns-email (central mail account): SQS queue shards with DLQs, one VPC Lambda mailer, DynamoDB tables
+  (mail-config, mail-migration, mail-delivery), SMTP credentials in Secrets Manager, private VPC with the
+  minimal endpoint set (DynamoDB gateway, Secrets Manager interface), log metrics and alarms.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: sample-sns-email
+    AllowedPattern: "^[a-z][a-z0-9-]{2,30}$"
+  CodeBucket: {Type: String, Description: S3 bucket holding the mailer zip (scripts/deploy.py uploads it)}
+  CodeKey: {Type: String, Description: S3 key of the mailer zip}
+  ShardCount:
+    Type: Number
+    AllowedValues: [1, 2, 3]
+    Default: 1
+  Shard1TopicArns:
+    Type: CommaDelimitedList
+    Default: ""
+    AllowedPattern: "^$|^arn:(aws|aws-cn):sns:[a-z]{2}(-[a-z]+)+-[0-9]:[0-9]{12}:[A-Za-z0-9_-]{1,256}$"
+    Description: Topic ARNs allowed to deliver into shard 1 (exact aws:SourceArn). Keep each shard's list small enough for the 8 KiB queue policy limit (about 60 ARNs).
+  Shard2TopicArns:
+    Type: CommaDelimitedList
+    Default: ""
+    AllowedPattern: "^$|^arn:(aws|aws-cn):sns:[a-z]{2}(-[a-z]+)+-[0-9]:[0-9]{12}:[A-Za-z0-9_-]{1,256}$"
+  Shard3TopicArns:
+    Type: CommaDelimitedList
+    Default: ""
+    AllowedPattern: "^$|^arn:(aws|aws-cn):sns:[a-z]{2}(-[a-z]+)+-[0-9]:[0-9]{12}:[A-Za-z0-9_-]{1,256}$"
+  DynamoDbPrefixListId:
+    Type: String
+    AllowedPattern: "^pl-[0-9a-f]+$"
+    Description: >-
+      ID of the AWS managed prefix list com.amazonaws.<region>.dynamodb (scripts/deploy.py looks it up; by hand:
+      aws ec2 describe-managed-prefix-lists --filters Name=prefix-list-name,Values=com.amazonaws.<region>.dynamodb
+      --query PrefixLists[0].PrefixListId). The Lambda security group may open HTTPS only to it and to the Secrets Manager endpoint.
+  VpcCidr: {Type: String, Default: 10.80.0.0/16}
+  PrivateSubnet1Cidr: {Type: String, Default: 10.80.1.0/24}
+  PrivateSubnet2Cidr: {Type: String, Default: 10.80.2.0/24}
+  SmtpHost: {Type: String, Default: smtp.example.com, Description: DNS name matching the SMTP server certificate}
+  SmtpPort: {Type: Number, Default: 587}
+  SmtpCidr: {Type: String, Default: 10.0.0.0/8, Description: Where the SMTP server is reachable from the Lambda subnets}
+  MailFrom: {Type: String, Default: notifications@example.com, Description: Envelope and header sender (allowed by the SMTP server)}
+  FunctionTimeoutSeconds: {Type: Number, Default: 60, MinValue: 30, MaxValue: 900, Description: "At least 30 s: the mailer keeps 12 s back (one SMTP exchange) before each recipient"}
+  QueueVisibilityTimeoutSeconds: {Type: Number, Default: 360, Description: At least 6 x the function timeout}
+  MaxReceiveCount: {Type: Number, Default: 5, MinValue: 1, MaxValue: 20}
+  MaxConcurrencyPerShard: {Type: Number, Default: 2, MinValue: 2, MaxValue: 50}
+  MaxSendsPerSecond: {Type: Number, Default: 5, MinValue: 0.1, Description: "Per execution environment (shared by its consecutive invocations); concurrent environments each have their own limit"}
+  ReservedConcurrency: {Type: Number, Default: 0, Description: 0 = no reservation; otherwise caps concurrent SMTP sessions}
+  AlarmTopicArn: {Type: String, Default: "", Description: Optional SNS topic for alarms (not the mail path itself)}
+  TableDeletionProtection: {Type: String, AllowedValues: ["true", "false"], Default: "true"}
+
+Conditions:
+  Shard2: !Not [!Equals [!Ref ShardCount, 1]]
+  Shard3: !Equals [!Ref ShardCount, 3]
+  Reserved: !Not [!Equals [!Ref ReservedConcurrency, 0]]
+  Alarming: !Not [!Equals [!Ref AlarmTopicArn, ""]]
+  Protect: !Equals [!Ref TableDeletionProtection, "true"]
+
+Resources:
+  # The account principal enables IAM delegation; it does not grant every caller key access.
+  # Keep the key for retained tables/backups. Cleanup intentionally does not schedule its deletion.
+  DataKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub "${NamePrefix} tables, SMTP secrets and queue shards"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableAccountPermissions
+            Effect: Allow
+            Principal: {AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"}
+            Action: "kms:*"
+            Resource: "*"
+          # SNS uses this principal in aws-cn too. Exact source ARNs include the member account ids.
+          # Use parameters, not queue/role references here, to avoid a dependency cycle.
+          - Sid: AllowShard1Topics
+            Effect: Allow
+            Principal: {Service: sns.amazonaws.com}
+            Action: ["kms:GenerateDataKey*", "kms:Decrypt"]
+            Resource: "*"
+            Condition: {ArnEquals: {"aws:SourceArn": !Ref Shard1TopicArns}}
+          - !If
+            - Shard2
+            - Sid: AllowShard2Topics
+              Effect: Allow
+              Principal: {Service: sns.amazonaws.com}
+              Action: ["kms:GenerateDataKey*", "kms:Decrypt"]
+              Resource: "*"
+              Condition: {ArnEquals: {"aws:SourceArn": !Ref Shard2TopicArns}}
+            - !Ref AWS::NoValue
+          - !If
+            - Shard3
+            - Sid: AllowShard3Topics
+              Effect: Allow
+              Principal: {Service: sns.amazonaws.com}
+              Action: ["kms:GenerateDataKey*", "kms:Decrypt"]
+              Resource: "*"
+              Condition: {ArnEquals: {"aws:SourceArn": !Ref Shard3TopicArns}}
+            - !Ref AWS::NoValue
+      Tags: [{Key: project, Value: sample-sns-email}]
+  DataKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${NamePrefix}-data"
+      TargetKeyId: !Ref DataKey
+
+  # ---------- network: private subnets only, no NAT ----------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: !Ref NamePrefix}, {Key: project, Value: sample-sns-email}]
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{Key: Name, Value: !Sub "${NamePrefix}-private-1"}, {Key: project, Value: sample-sns-email}]
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{Key: Name, Value: !Sub "${NamePrefix}-private-2"}, {Key: project, Value: sample-sns-email}]
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: !Sub "${NamePrefix}-private"}, {Key: project, Value: sample-sns-email}]
+  PrivateSubnet1Routes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivateSubnet1, RouteTableId: !Ref PrivateRouteTable}
+  PrivateSubnet2Routes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivateSubnet2, RouteTableId: !Ref PrivateRouteTable}
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: mailer Lambda (egress to SMTP and the VPC endpoints only)
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - {IpProtocol: tcp, FromPort: !Ref SmtpPort, ToPort: !Ref SmtpPort, CidrIp: !Ref SmtpCidr, Description: SMTP}
+      Tags: [{Key: Name, Value: !Sub "${NamePrefix}-lambda"}, {Key: project, Value: sample-sns-email}]
+  # HTTPS egress is separate from the group: LambdaSecurityGroup is referenced by EndpointSecurityGroup's ingress rule, so
+  # an inline egress rule pointing back at EndpointSecurityGroup would be a circular reference. (Keep both GroupDescription
+  # texts as they are: a changed description replaces the group, and with it the ids other stacks hold.)
+  LambdaToSecretsManagerEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !Ref EndpointSecurityGroup
+      Description: HTTPS to the Secrets Manager interface endpoint
+  LambdaToDynamoDbEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationPrefixListId: !Ref DynamoDbPrefixListId
+      Description: HTTPS to DynamoDB through the gateway endpoint (managed prefix list)
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: interface endpoints (HTTPS from the mailer)
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, SourceSecurityGroupId: !Ref LambdaSecurityGroup, Description: HTTPS from the mailer}
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 127.0.0.1/32
+          Description: no egress required; this SG only accepts inbound 443 from the mailer
+      Tags: [{Key: Name, Value: !Sub "${NamePrefix}-endpoints"}, {Key: project, Value: sample-sns-email}]
+  DynamoDbEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Gateway
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.dynamodb"
+      RouteTableIds: [!Ref PrivateRouteTable]
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.secretsmanager"
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  # ---------- SMTP credentials (generated, never in templates or logs) ----------
+  SmtpSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${NamePrefix}/smtp"
+      KmsKeyId: !GetAtt DataKey.Arn
+      Description: SMTP AUTH credentials of the mailer (username + generated password)
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "mailer"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+      Tags: [{Key: project, Value: sample-sns-email}]
+  SmtpCaSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${NamePrefix}/smtp-ca"
+      KmsKeyId: !GetAtt DataKey.Arn
+      Description: PEM of the CA that signs the SMTP server certificate (empty = system trust store)
+      SecretString: " "
+      Tags: [{Key: project, Value: sample-sns-email}]
+
+  # ---------- data ----------
+  ConfigTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${NamePrefix}-mail-config"
+      SSESpecification: {SSEEnabled: true, SSEType: KMS, KMSMasterKeyId: !GetAtt DataKey.Arn}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: pk, AttributeType: S}, {AttributeName: sk, AttributeType: S}]
+      KeySchema: [{AttributeName: pk, KeyType: HASH}, {AttributeName: sk, KeyType: RANGE}]
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      StreamSpecification: {StreamViewType: NEW_AND_OLD_IMAGES}
+      DeletionProtectionEnabled: !If [Protect, true, false]
+      Tags: [{Key: project, Value: sample-sns-email}]
+  MigrationTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${NamePrefix}-mail-migration"
+      SSESpecification: {SSEEnabled: true, SSEType: KMS, KMSMasterKeyId: !GetAtt DataKey.Arn}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: pk, AttributeType: S}, {AttributeName: sk, AttributeType: S}]
+      KeySchema: [{AttributeName: pk, KeyType: HASH}, {AttributeName: sk, KeyType: RANGE}]
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      DeletionProtectionEnabled: !If [Protect, true, false]
+      Tags: [{Key: project, Value: sample-sns-email}]
+  DeliveryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${NamePrefix}-mail-delivery"
+      SSESpecification: {SSEEnabled: true, SSEType: KMS, KMSMasterKeyId: !GetAtt DataKey.Arn}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: pk, AttributeType: S}, {AttributeName: sk, AttributeType: S}]
+      KeySchema: [{AttributeName: pk, KeyType: HASH}, {AttributeName: sk, KeyType: RANGE}]
+      TimeToLiveSpecification: {AttributeName: expiresAt, Enabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      DeletionProtectionEnabled: !If [Protect, true, false]
+      Tags: [{Key: project, Value: sample-sns-email}]
+
+  # ---------- queues: one per shard, each with its DLQ and an exact SourceArn allow-list ----------
+  Shard1Dlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${NamePrefix}-s1-dlq"
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !GetAtt DataKey.Arn
+      Tags: [{Key: project, Value: sample-sns-email}]
+  Shard1Queue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${NamePrefix}-s1"
+      MessageRetentionPeriod: 345600
+      VisibilityTimeout: !Ref QueueVisibilityTimeoutSeconds
+      KmsMasterKeyId: !GetAtt DataKey.Arn
+      RedrivePolicy: {deadLetterTargetArn: !GetAtt Shard1Dlq.Arn, maxReceiveCount: !Ref MaxReceiveCount}
+      Tags: [{Key: project, Value: sample-sns-email}]
+  Shard1Policy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref Shard1Queue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: RegisteredTopicsOnly
+            Effect: Allow
+            Principal: {Service: sns.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource: !GetAtt Shard1Queue.Arn
+            Condition: {ArnEquals: {"aws:SourceArn": !Ref Shard1TopicArns}}
+  Shard1Mapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref Mailer
+      EventSourceArn: !GetAtt Shard1Queue.Arn
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 2
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      ScalingConfig: {MaximumConcurrency: !Ref MaxConcurrencyPerShard}
+
+  Shard2Dlq:
+    Type: AWS::SQS::Queue
+    Condition: Shard2
+    Properties:
+      QueueName: !Sub "${NamePrefix}-s2-dlq"
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !GetAtt DataKey.Arn
+      Tags: [{Key: project, Value: sample-sns-email}]
+  Shard2Queue:
+    Type: AWS::SQS::Queue
+    Condition: Shard2
+    Properties:
+      QueueName: !Sub "${NamePrefix}-s2"
+      MessageRetentionPeriod: 345600
+      VisibilityTimeout: !Ref QueueVisibilityTimeoutSeconds
+      KmsMasterKeyId: !GetAtt DataKey.Arn
+      RedrivePolicy: {deadLetterTargetArn: !GetAtt Shard2Dlq.Arn, maxReceiveCount: !Ref MaxReceiveCount}
+      Tags: [{Key: project, Value: sample-sns-email}]
+  Shard2Policy:
+    Type: AWS::SQS::QueuePolicy
+    Condition: Shard2
+    Properties:
+      Queues: [!Ref Shard2Queue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: RegisteredTopicsOnly
+            Effect: Allow
+            Principal: {Service: sns.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource: !GetAtt Shard2Queue.Arn
+            Condition: {ArnEquals: {"aws:SourceArn": !Ref Shard2TopicArns}}
+  Shard2Mapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: Shard2
+    Properties:
+      FunctionName: !Ref Mailer
+      EventSourceArn: !GetAtt Shard2Queue.Arn
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 2
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      ScalingConfig: {MaximumConcurrency: !Ref MaxConcurrencyPerShard}
+
+  Shard3Dlq:
+    Type: AWS::SQS::Queue
+    Condition: Shard3
+    Properties:
+      QueueName: !Sub "${NamePrefix}-s3-dlq"
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !GetAtt DataKey.Arn
+      Tags: [{Key: project, Value: sample-sns-email}]
+  Shard3Queue:
+    Type: AWS::SQS::Queue
+    Condition: Shard3
+    Properties:
+      QueueName: !Sub "${NamePrefix}-s3"
+      MessageRetentionPeriod: 345600
+      VisibilityTimeout: !Ref QueueVisibilityTimeoutSeconds
+      KmsMasterKeyId: !GetAtt DataKey.Arn
+      RedrivePolicy: {deadLetterTargetArn: !GetAtt Shard3Dlq.Arn, maxReceiveCount: !Ref MaxReceiveCount}
+      Tags: [{Key: project, Value: sample-sns-email}]
+  Shard3Policy:
+    Type: AWS::SQS::QueuePolicy
+    Condition: Shard3
+    Properties:
+      Queues: [!Ref Shard3Queue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: RegisteredTopicsOnly
+            Effect: Allow
+            Principal: {Service: sns.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource: !GetAtt Shard3Queue.Arn
+            Condition: {ArnEquals: {"aws:SourceArn": !Ref Shard3TopicArns}}
+  Shard3Mapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: Shard3
+    Properties:
+      FunctionName: !Ref Mailer
+      EventSourceArn: !GetAtt Shard3Queue.Arn
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 2
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      ScalingConfig: {MaximumConcurrency: !Ref MaxConcurrencyPerShard}
+
+  # ---------- the mailer ----------
+  MailerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]
+      ManagedPolicyArns: [!Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"]
+      Policies:
+        - PolicyName: mailer
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes, sqs:ChangeMessageVisibility]
+                Resource: !Sub "arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${NamePrefix}-s?"
+              - Effect: Allow      # read-only on configuration
+                Action: [dynamodb:GetItem, dynamodb:BatchGetItem]
+                Resource: !GetAtt ConfigTable.Arn
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:GetItem, dynamodb:DeleteItem]
+                Resource: !GetAtt DeliveryTable.Arn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: [!Ref SmtpSecret, !Ref SmtpCaSecret]
+              # ViaService uses .amazonaws.com in every partition, including aws-cn.
+              - Sid: DecryptQueueMessages
+                Effect: Allow
+                Action: ["kms:Decrypt"]
+                Resource: !GetAtt DataKey.Arn
+                Condition:
+                  StringEquals:
+                    "kms:ViaService": !Sub "sqs.${AWS::Region}.amazonaws.com"
+                    "kms:CallerAccount": !Ref AWS::AccountId
+              - Sid: DecryptTableKeys
+                Effect: Allow
+                Action: ["kms:Decrypt"]
+                Resource: !GetAtt DataKey.Arn
+                Condition:
+                  StringEquals:
+                    "kms:ViaService": !Sub "dynamodb.${AWS::Region}.amazonaws.com"
+                    "kms:CallerAccount": !Ref AWS::AccountId
+                    "kms:EncryptionContext:aws:dynamodb:tableName": [!Ref ConfigTable, !Ref DeliveryTable]
+                    "kms:EncryptionContext:aws:dynamodb:subscriberId": !Ref AWS::AccountId
+              - Sid: DecryptSmtpSecrets
+                Effect: Allow
+                Action: ["kms:Decrypt"]
+                Resource: !GetAtt DataKey.Arn
+                Condition:
+                  StringEquals:
+                    "kms:ViaService": !Sub "secretsmanager.${AWS::Region}.amazonaws.com"
+                    "kms:CallerAccount": !Ref AWS::AccountId
+                    "kms:EncryptionContext:SecretARN": [!Ref SmtpSecret, !Ref SmtpCaSecret]
+      Tags: [{Key: project, Value: sample-sns-email}]
+  MailerLogs:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: "CloudWatch Logs encrypts at rest by default; the function never logs bodies, addresses or SMTP replies"
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${NamePrefix}-mailer"
+      RetentionInDays: 30
+      Tags: [{Key: project, Value: sample-sns-email}]
+  Mailer:
+    Type: AWS::Lambda::Function
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_173
+            comment: "environment holds names, ARNs and non-secret settings (SMTP host and port, sender address, rates); the SMTP credentials are in Secrets Manager"
+          - id: CKV_AWS_116
+            comment: "SQS-triggered: failed records go to each queue's redrive DLQ; a function DLQ applies to async invocations only"
+    DependsOn: MailerLogs
+    Properties:
+      FunctionName: !Sub "${NamePrefix}-mailer"
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Code: {S3Bucket: !Ref CodeBucket, S3Key: !Ref CodeKey}
+      Role: !GetAtt MailerRole.Arn
+      MemorySize: 256
+      Timeout: !Ref FunctionTimeoutSeconds
+      ReservedConcurrentExecutions: !If [Reserved, !Ref ReservedConcurrency, !Ref AWS::NoValue]
+      VpcConfig:
+        SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+        SecurityGroupIds: [!Ref LambdaSecurityGroup]
+      Environment:
+        Variables:
+          CONFIG_TABLE: !Ref ConfigTable
+          DELIVERY_TABLE: !Ref DeliveryTable
+          SMTP_SECRET_ARN: !Ref SmtpSecret
+          SMTP_CA_SECRET_ARN: !Ref SmtpCaSecret
+          SMTP_HOST: !Ref SmtpHost
+          SMTP_PORT: !Ref SmtpPort
+          MAIL_FROM: !Ref MailFrom
+          MAX_SENDS_PER_SECOND: !Ref MaxSendsPerSecond
+          LEASE_SECONDS: !Ref QueueVisibilityTimeoutSeconds
+      Tags: [{Key: project, Value: sample-sns-email}]
+
+  # ---------- monitoring (alarms go to a channel other than this mail path) ----------
+  FailedMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref MailerLogs
+      FilterPattern: '{ $.event = "mail_failed" }'
+      MetricTransformations: [{MetricNamespace: !Ref NamePrefix, MetricName: MailFailed, MetricValue: "1", DefaultValue: 0}]
+  ConfigMissingMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref MailerLogs
+      FilterPattern: '{ $.event = "config_missing" }'
+      MetricTransformations: [{MetricNamespace: !Ref NamePrefix, MetricName: ConfigMissing, MetricValue: "1", DefaultValue: 0}]
+  RejectedMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref MailerLogs
+      FilterPattern: '{ $.event = "mail_rejected" }'
+      MetricTransformations: [{MetricNamespace: !Ref NamePrefix, MetricName: MailRejected, MetricValue: "1", DefaultValue: 0}]
+  FailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${NamePrefix}-mail-failed"
+      Namespace: !Ref NamePrefix
+      MetricName: MailFailed
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [Alarming, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+  ConfigMissingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${NamePrefix}-config-missing"
+      Namespace: !Ref NamePrefix
+      MetricName: ConfigMissing
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [Alarming, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+  RejectedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${NamePrefix}-mail-rejected"
+      Namespace: !Ref NamePrefix
+      MetricName: MailRejected
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [Alarming, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+  ErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${NamePrefix}-lambda-errors"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref Mailer}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [Alarming, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+  Shard1DlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${NamePrefix}-s1-dlq"
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{Name: QueueName, Value: !GetAtt Shard1Dlq.QueueName}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [Alarming, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+  Shard1AgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${NamePrefix}-s1-oldest"
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions: [{Name: QueueName, Value: !GetAtt Shard1Queue.QueueName}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 600
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [Alarming, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+  Shard2DlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: Shard2
+    Properties:
+      AlarmName: !Sub "${NamePrefix}-s2-dlq"
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{Name: QueueName, Value: !GetAtt Shard2Dlq.QueueName}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [Alarming, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+  Shard3DlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: Shard3
+    Properties:
+      AlarmName: !Sub "${NamePrefix}-s3-dlq"
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{Name: QueueName, Value: !GetAtt Shard3Dlq.QueueName}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [Alarming, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+Outputs:
+  DataKeyArn: {Value: !GetAtt DataKey.Arn}
+  VpcId: {Value: !Ref Vpc}
+  VpcCidr: {Value: !Ref VpcCidr}
+  PrivateRouteTableId: {Value: !Ref PrivateRouteTable}
+  LambdaSecurityGroupId: {Value: !Ref LambdaSecurityGroup}
+  EndpointSecurityGroupId: {Value: !Ref EndpointSecurityGroup}
+  Shard1QueueArn: {Value: !GetAtt Shard1Queue.Arn}
+  Shard1QueueUrl: {Value: !Ref Shard1Queue}
+  Shard1DlqArn: {Value: !GetAtt Shard1Dlq.Arn}
+  Shard1DlqUrl: {Value: !Ref Shard1Dlq}
+  ConfigTableName: {Value: !Ref ConfigTable}
+  MigrationTableName: {Value: !Ref MigrationTable}
+  DeliveryTableName: {Value: !Ref DeliveryTable}
+  SmtpSecretArn: {Value: !Ref SmtpSecret}
+  SmtpCaSecretArn: {Value: !Ref SmtpCaSecret}
+  MailerFunctionName: {Value: !Ref Mailer}

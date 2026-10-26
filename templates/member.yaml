@@ -1,0 +1,128 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  sample-sns-email (member account): lets the central mail account subscribe its SQS queues to this
+  account's topics, and gives the central migration tooling a read-only inventory role and a narrow
+  unsubscribe role. Optionally creates demo topics for testing.
+
+Parameters:
+  CentralAccountId:
+    Type: String
+    AllowedPattern: "^[0-9]{12}$"
+    Description: Account that owns the mail queues (it creates the SQS subscriptions as queue owner).
+  MigrationTopicArns:
+    Type: CommaDelimitedList
+    Default: ""
+    AllowedPattern: "^$|^arn:(aws|aws-cn):sns:[a-z]{2}(-[a-z]+)+-[0-9]:[0-9]{12}:[A-Za-z0-9_-]{1,256}$"
+    Description: Exact topic ARNs whose legacy subscriptions may be removed. Set before remove-email; empty grants no migration permissions.
+  CreateDemoTopics:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: >-
+      Create demo topics (orders, billing, unregistered) with a topic policy for the central account. For
+      existing topics, add the same policy statement in the template that owns each topic (see README):
+      a topic has one policy document, and a second stack would overwrite it.
+  NamePrefix:
+    Type: String
+    Default: sample-sns-email
+    AllowedPattern: "^[a-z][a-z0-9-]{2,30}$"
+
+Conditions:
+  Demo: !Equals [!Ref CreateDemoTopics, "true"]
+  MigrationEnabled: !Not [!Equals [!Select [0, !Ref MigrationTopicArns], ""]]
+
+Resources:
+  OrdersTopic:
+    Type: AWS::SNS::Topic
+    Condition: Demo
+    Properties:
+      TopicName: !Sub "${NamePrefix}-orders"
+      Tags: [{Key: project, Value: sample-sns-email}]
+  BillingTopic:
+    Type: AWS::SNS::Topic
+    Condition: Demo
+    Properties:
+      TopicName: !Sub "${NamePrefix}-billing"
+      Tags: [{Key: project, Value: sample-sns-email}]
+  # Has the same subscribe permission but is never registered in a queue policy: delivery must be refused.
+  UnregisteredTopic:
+    Type: AWS::SNS::Topic
+    Condition: Demo
+    Properties:
+      TopicName: !Sub "${NamePrefix}-unregistered"
+      Tags: [{Key: project, Value: sample-sns-email}]
+
+  DemoTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: Demo
+    Properties:
+      Topics: [!Ref OrdersTopic, !Ref BillingTopic, !Ref UnregisteredTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: OwnerFullControl
+            Effect: Allow
+            Principal: {AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"}
+            Action: [sns:Publish, sns:Subscribe, sns:GetTopicAttributes, sns:SetTopicAttributes, sns:AddPermission, sns:RemovePermission, sns:DeleteTopic, sns:ListSubscriptionsByTopic]
+            Resource: "*"
+          # The statement to add to every migrated topic's policy:
+          - Sid: CentralMailAccountSubscribe
+            Effect: Allow
+            Principal: {AWS: !Sub "arn:${AWS::Partition}:iam::${CentralAccountId}:root"}
+            Action: ["sns:Subscribe"]
+            Resource: "*"
+            Condition:
+              StringEquals: {"sns:Protocol": "sqs"}
+
+  # Read-only inventory of topics and subscriptions, assumed by the central migration tooling.
+  InventoryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${NamePrefix}-inventory"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {AWS: !Sub "arn:${AWS::Partition}:iam::${CentralAccountId}:root"}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: inventory
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [sns:ListTopics, sns:ListSubscriptions, sns:ListSubscriptionsByTopic, sns:GetTopicAttributes, sns:GetSubscriptionAttributes]
+                Resource: "*"
+      Tags: [{Key: project, Value: sample-sns-email}]
+
+  # Opt-in unsubscribe permission for exact topics; remove-email enforces the cut-over workflow.
+  # SNS authorizes Unsubscribe against the topic, not the subscription ARN.
+  # sns:Protocol is not supported for this action: https://docs.aws.amazon.com/service-authorization/latest/reference/list_sns.html
+  MigrationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${NamePrefix}-migration"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {AWS: !Sub "arn:${AWS::Partition}:iam::${CentralAccountId}:root"}
+            Action: sts:AssumeRole
+      Policies: !If
+        - MigrationEnabled
+        - - PolicyName: unsubscribe-email
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: [sns:Unsubscribe]
+                  Resource: !Ref MigrationTopicArns
+        - !Ref AWS::NoValue
+      Tags: [{Key: project, Value: sample-sns-email}]
+
+Outputs:
+  InventoryRoleArn: {Value: !GetAtt InventoryRole.Arn}
+  MigrationRoleArn: {Value: !GetAtt MigrationRole.Arn}
+  OrdersTopicArn: {Condition: Demo, Value: !Ref OrdersTopic}
+  BillingTopicArn: {Condition: Demo, Value: !Ref BillingTopic}
+  UnregisteredTopicArn: {Condition: Demo, Value: !Ref UnregisteredTopic}

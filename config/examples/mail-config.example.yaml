@@ -1,0 +1,21 @@
+# Recipient configuration (source of truth; published to the mail-config table by tools/mailcfg.py).
+schema: 1
+allowedDomains: [example.com]
+groups:
+  orders-oncall:
+    ownerTeam: orders
+    members: [oncall-1@example.com, oncall-2@example.com]
+topics:
+  - topicArn: arn:aws:sns:us-west-2:111122223333:orders-alerts      # aws-cn partition: arn:aws-cn:sns:cn-north-1:...
+    mode: live          # "off" | "shadow" (resolve and record, send nothing) | "live" (quote "off": a bare off is YAML false)
+    recipients: [orders-team@example.com]
+    groups: [orders-oncall]
+    format: text        # text (email) | json (email-json: the SNS envelope as the body)
+    defaultSubject: Orders notification
+    ownerTeam: orders
+    shard: s1
+  - topicArn: arn:aws:sns:us-west-2:111122223333:billing-jobs
+    mode: shadow
+    recipients: [billing@example.com]
+    ownerTeam: billing
+    shard: s1

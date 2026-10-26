@@ -1,0 +1,217 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  sample-sns-email TEST ONLY: a small Postfix server standing in for the enterprise SMTP. Submission port 587,
+  STARTTLS required, SASL AUTH required (credentials from the central stack's secret), certificate from a CA
+  generated on the host (its PEM is written to the central stack's CA secret). Accepted mail is either relayed
+  with the Amazon SES API (DeliveryMode=ses) or stored on the host (DeliveryMode=store). Not a production MTA.
+
+Parameters:
+  NamePrefix: {Type: String, Default: sample-sns-email}
+  VpcId: {Type: AWS::EC2::VPC::Id}
+  PublicSubnetCidr: {Type: String, Default: 10.80.100.0/24}
+  LambdaSecurityGroupId: {Type: AWS::EC2::SecurityGroup::Id}
+  EndpointSecurityGroupId: {Type: AWS::EC2::SecurityGroup::Id, Description: "central stack's interface endpoint SG (private DNS sends the host's Secrets Manager calls there)"}
+  SmtpSecretArn: {Type: String}
+  SmtpCaSecretArn: {Type: String}
+  DataKeyArn: {Type: String, Description: "DataKeyArn output of the central stack (same account and Region)"}
+  DeliveryMode: {Type: String, AllowedValues: [ses, store], Default: store}
+  SesConfigurationSet: {Type: String, Default: ""}
+  InstanceType: {Type: String, Default: t3.micro}
+  ImageId: {Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>", Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}
+
+Rules:
+  SesOnlyInAwsPartition:
+    RuleCondition: !Equals [!Ref "AWS::Partition", aws-cn]
+    Assertions:
+      - Assert: !Equals [!Ref DeliveryMode, store]
+        AssertDescription: DeliveryMode=ses relays through Amazon SES, which is available only in the aws partition. In China Regions use DeliveryMode=store.
+
+Conditions:
+  Ses: !Equals [!Ref DeliveryMode, ses]
+
+Resources:
+  # The test host needs package repositories (and the SES API) at boot; the mailer subnets stay private.
+  Igw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{Key: Name, Value: !Sub "${NamePrefix}-test-smtp"}, {Key: project, Value: sample-sns-email}]
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref VpcId, InternetGatewayId: !Ref Igw}
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VpcId
+      CidrBlock: !Ref PublicSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: !Sub "${NamePrefix}-test-smtp"}, {Key: project, Value: sample-sns-email}]
+  PublicRoutes:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VpcId
+      Tags: [{Key: Name, Value: !Sub "${NamePrefix}-test-smtp"}, {Key: project, Value: sample-sns-email}]
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties: {RouteTableId: !Ref PublicRoutes, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref Igw}
+  PublicSubnetRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicSubnet, RouteTableId: !Ref PublicRoutes}
+  SmtpSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: test SMTP (submission from the mailer Lambda only)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 587, ToPort: 587, SourceSecurityGroupId: !Ref LambdaSecurityGroupId, Description: SMTP submission from the mailer}
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationSecurityGroupId: !Ref EndpointSecurityGroupId
+          Description: HTTPS to the Secrets Manager interface endpoint
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS for the SSM agent (no SSM interface endpoints in this test stack)
+      Tags: [{Key: Name, Value: !Sub "${NamePrefix}-test-smtp"}, {Key: project, Value: sample-sns-email}]
+  EndpointAccess:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EndpointSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref SmtpSecurityGroup
+      Description: test SMTP host to the Secrets Manager endpoint
+  HostRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: sts:AssumeRole}]
+      ManagedPolicyArns: [!Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"]
+      Policies:
+        - PolicyName: test-smtp
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - {Effect: Allow, Action: secretsmanager:GetSecretValue, Resource: !Ref SmtpSecretArn}
+              - {Effect: Allow, Action: secretsmanager:PutSecretValue, Resource: !Ref SmtpCaSecretArn}
+              - Sid: ReadSmtpSecretKey
+                Effect: Allow
+                Action: ["kms:Decrypt"]
+                Resource: !Ref DataKeyArn
+                Condition:
+                  StringEquals:
+                    "kms:ViaService": !Sub "secretsmanager.${AWS::Region}.amazonaws.com"
+                    "kms:CallerAccount": !Ref AWS::AccountId
+                    "kms:EncryptionContext:SecretARN": !Ref SmtpSecretArn
+              - Sid: WriteSmtpCaKey
+                Effect: Allow
+                Action: ["kms:GenerateDataKey", "kms:Decrypt"]
+                Resource: !Ref DataKeyArn
+                Condition:
+                  StringEquals:
+                    "kms:ViaService": !Sub "secretsmanager.${AWS::Region}.amazonaws.com"
+                    "kms:CallerAccount": !Ref AWS::AccountId
+                    "kms:EncryptionContext:SecretARN": !Ref SmtpCaSecretArn
+              - !If
+                - Ses
+                - Effect: Allow
+                  Action: [ses:SendRawEmail, ses:SendEmail]
+                  # in the SES sandbox the verified recipient identities are checked as well
+                  Resource: [!Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/*", !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:configuration-set/*"]
+                - !Ref AWS::NoValue
+      Tags: [{Key: project, Value: sample-sns-email}]
+  HostProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: {Roles: [!Ref HostRole]}
+  Host:
+    Type: AWS::EC2::Instance
+    DependsOn: [DefaultRoute, EndpointAccess]
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref HostProfile
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds: [!Ref SmtpSecurityGroup]
+      MetadataOptions: {HttpTokens: required}
+      BlockDeviceMappings: [{DeviceName: /dev/xvda, Ebs: {VolumeSize: 8, VolumeType: gp3, Encrypted: true}}]
+      Tags: [{Key: Name, Value: !Sub "${NamePrefix}-test-smtp"}, {Key: project, Value: sample-sns-email}]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          exec > /var/log/sample-smtp-setup.log 2>&1
+          dnf install -y -q postfix cyrus-sasl cyrus-sasl-plain openssl python3
+          if [ "${DeliveryMode}" = ses ]; then dnf install -y -q python3-boto3; fi
+          TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')
+          HOST=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-hostname)
+          # certificate: a CA made here signs the server certificate for the host's private DNS name
+          install -d -m 700 /etc/postfix/tls
+          cd /etc/postfix/tls
+          openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj "/CN=${NamePrefix} test CA" -keyout ca.key -out ca.pem
+          openssl req -newkey rsa:2048 -nodes -subj "/CN=$HOST" -keyout server.key -out server.csr
+          printf "subjectAltName=DNS:%s\nextendedKeyUsage=serverAuth\n" "$HOST" > ext.cnf
+          openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 30 -extfile ext.cnf -out server.pem
+          rm -f ca.key server.csr
+          chmod 600 server.key
+          aws secretsmanager put-secret-value --region ${AWS::Region} --secret-id ${SmtpCaSecretArn} --secret-string file:///etc/postfix/tls/ca.pem > /dev/null
+          # SMTP AUTH user from the generated secret (never printed)
+          aws secretsmanager get-secret-value --region ${AWS::Region} --secret-id ${SmtpSecretArn} --query SecretString --output text \
+            | python3 -c 'import json,sys,subprocess; s=json.load(sys.stdin); subprocess.run(["saslpasswd2","-f","/etc/sasl2/sasldb2","-p","-c","-u","sample",s["username"]],input=s["password"].encode(),check=True)'
+          chgrp postfix /etc/sasl2/sasldb2
+          chmod 640 /etc/sasl2/sasldb2
+          printf "pwcheck_method: auxprop\nauxprop_plugin: sasldb\nsasldb_path: /etc/sasl2/sasldb2\nmech_list: PLAIN LOGIN\n" > /etc/sasl2/smtpd.conf
+          # delivery: every accepted message goes to the sample-deliver pipe (SES API or a local store)
+          install -d -o nobody -g nobody -m 700 /var/spool/sample-mail
+          # test evidence: this log holds plain sender/recipient addresses and the spool holds message bodies (owner-only)
+          install -o nobody -g nobody -m 600 /dev/null /var/log/sample-smtp.log
+          cat > /usr/local/bin/sample-deliver <<'PY'
+          #!/usr/bin/python3
+          import datetime, hashlib, json, os, sys, uuid
+          sender, recipient = sys.argv[1], sys.argv[2]
+          raw = sys.stdin.buffer.read()
+          entry = {"time": datetime.datetime.utcnow().isoformat() + "Z", "from": sender, "to": recipient, "bytes": len(raw),
+                   "sha256": hashlib.sha256(raw).hexdigest()[:16], "mode": os.environ["MODE"]}
+          try:
+              if os.environ["MODE"] == "ses":
+                  import boto3
+                  args = {"FromEmailAddress": sender, "Destination": {"ToAddresses": [recipient]}, "Content": {"Raw": {"Data": raw}}}
+                  if os.environ.get("CONFIG_SET"):
+                      args["ConfigurationSetName"] = os.environ["CONFIG_SET"]
+                  entry["sesMessageId"] = boto3.client("sesv2", region_name=os.environ["REGION"]).send_email(**args)["MessageId"]
+              else:
+                  name = "/var/spool/sample-mail/%s-%s.eml" % (entry["time"].replace(":", ""), uuid.uuid4().hex[:8])
+                  open(name, "wb").write(raw)
+                  entry["stored"] = name
+              entry["status"] = "accepted"
+              code = 0
+          except Exception as error:
+              entry["status"], entry["error"] = "failed", type(error).__name__
+              code = 75   # EX_TEMPFAIL: Postfix keeps the message and retries
+          open("/var/log/sample-smtp.log", "a").write(json.dumps(entry) + "\n")
+          sys.exit(code)
+          PY
+          chmod 755 /usr/local/bin/sample-deliver
+          postconf -e "myhostname = $HOST" "mydestination =" "local_recipient_maps =" "inet_interfaces = all" "inet_protocols = ipv4" \
+            "default_transport = sampledeliver" "relay_transport = sampledeliver" "sampledeliver_destination_recipient_limit = 1" \
+            "smtpd_tls_cert_file = /etc/postfix/tls/server.pem" "smtpd_tls_key_file = /etc/postfix/tls/server.key" \
+            "smtpd_tls_security_level = encrypt" "smtpd_tls_auth_only = yes" "smtpd_tls_mandatory_protocols = >=TLSv1.2" \
+            "smtpd_sasl_auth_enable = yes" "smtpd_sasl_type = cyrus" "smtpd_sasl_path = smtpd" "smtpd_sasl_local_domain = sample" \
+            "smtpd_relay_restrictions = permit_sasl_authenticated, reject" "smtpd_recipient_restrictions = permit_sasl_authenticated, reject" \
+            "message_size_limit = 1048576"
+          postconf -M "submission/inet=submission inet n - n - - smtpd"
+          postconf -P "submission/inet/syslog_name=postfix/submission" "submission/inet/smtpd_tls_security_level=encrypt" \
+            "submission/inet/smtpd_sasl_auth_enable=yes" "submission/inet/smtpd_client_restrictions=permit_sasl_authenticated,reject"
+          postconf -M "sampledeliver/unix=sampledeliver unix - n n - 2 pipe flags=Rq user=nobody argv=/usr/bin/env MODE=${DeliveryMode} REGION=${AWS::Region} CONFIG_SET=${SesConfigurationSet} /usr/local/bin/sample-deliver \${!sender} \${!recipient}"
+          postconf -M# smtp/inet   # nothing listens on 25
+          systemctl enable --now postfix
+          echo setup-complete
+
+Outputs:
+  SmtpHost: {Value: !GetAtt Host.PrivateDnsName, Description: Use as the central stack's SmtpHost}
+  InstanceId: {Value: !Ref Host}
